@@ -166,13 +166,28 @@ class AnimeCube : AnimeHttpSource() {
                 val seasonId = season.id ?: "tab-1"
                 season.episodes?.forEach { ep ->
                     val epId = ep.id ?: return@forEach
-                    if (!ep.redirectHref.isNullOrBlank()) return@forEach
                     val epNumber = ep.number ?: 1f
                     val epTitle = ep.title?.takeIf { it.isNotBlank() } ?: "Episode ${epNumber.toInt()}"
 
+                    val epUrl = ep.redirectHref?.trim()?.takeIf { it.isNotEmpty() }?.let { redirect ->
+                        val httpUrl = (if (redirect.startsWith("http")) redirect else "$baseUrl$redirect").toHttpUrlOrNull()
+                        if (httpUrl != null) {
+                            val targetSlug = httpUrl.pathSegments.lastOrNull { it.isNotEmpty() } ?: animeSlug
+                            val targetSeasonId = httpUrl.queryParameter("seasonId")
+                                ?: httpUrl.queryParameter("season")
+                                ?: seasonId
+                            val targetEpId = httpUrl.queryParameter("episodeId")
+                                ?: httpUrl.queryParameter("episode")
+                                ?: epId
+                            "/anime/$targetSlug?primaryTabId=primary-1&seasonId=$targetSeasonId&episodeId=$targetEpId"
+                        } else {
+                            null
+                        }
+                    } ?: "/anime/$animeSlug?primaryTabId=$tabId&seasonId=$seasonId&episodeId=$epId"
+
                     episodes.add(
                         SEpisode.create().apply {
-                            url = "/anime/$animeSlug?primaryTabId=$tabId&seasonId=$seasonId&episodeId=$epId"
+                            url = epUrl
                             name = epTitle
                             episode_number = epNumber
                             date_upload = synchronized(dateFormat) { dateFormat.tryParse(ep.publishedAt) }
