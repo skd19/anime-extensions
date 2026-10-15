@@ -66,6 +66,7 @@ class EpisodeDto(
     val number: Float? = null,
     val title: String? = null,
     val publishedAt: String? = null,
+    val redirectHref: String? = null,
 )
 
 @Serializable

@@ -166,6 +166,7 @@ class AnimeCube : AnimeHttpSource() {
                 val seasonId = season.id ?: "tab-1"
                 season.episodes?.forEach { ep ->
                     val epId = ep.id ?: return@forEach
+                    if (!ep.redirectHref.isNullOrBlank()) return@forEach
                     val epNumber = ep.number ?: 1f
                     val epTitle = ep.title?.takeIf { it.isNotBlank() } ?: "Episode ${epNumber.toInt()}"
 
