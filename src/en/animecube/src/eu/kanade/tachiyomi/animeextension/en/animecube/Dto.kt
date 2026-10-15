@@ -29,6 +29,11 @@ class SourceItem(
 )
 
 @Serializable
+class ReleasePreviewDto(
+    val studio: String? = null,
+)
+
+@Serializable
 class AnimeDetailDto(
     val title: String? = null,
     val description: String? = null,
@@ -37,6 +42,9 @@ class AnimeDetailDto(
     val status: String? = null,
     val year: Int? = null,
     val slug: String? = null,
+    val studio: String? = null,
+    val studios: List<String>? = emptyList(),
+    val releasePreview: ReleasePreviewDto? = null,
     val primaryTabs: List<PrimaryTabDto>? = emptyList(),
 )
 

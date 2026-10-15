@@ -96,13 +96,8 @@ class AnimeCube : AnimeHttpSource() {
     override fun searchAnimeParse(response: Response): AnimesPage {
         val requestUrl = response.request.url.toString()
         if (requestUrl.contains("/anime/")) {
-            val doc = Jsoup.parse(response.body.string(), baseUrl)
-            val title = doc.selectFirst("h1")?.text()?.trim() ?: "Anime"
-            val anime = SAnime.create().apply {
-                this.title = title
+            val anime = animeDetailsParse(response).apply {
                 url = requestUrl.substringAfter(baseUrl).substringBefore("?")
-                author = "AnimeCube"
-                artist = "AnimeCube"
             }
             return AnimesPage(listOf(anime), hasNextPage = false)
         }
@@ -124,8 +119,16 @@ class AnimeCube : AnimeHttpSource() {
         val animeData = extractAnimeJsonFromRsc(html)
 
         return SAnime.create().apply {
-            author = "AnimeCube"
-            artist = "AnimeCube"
+            val doc by lazy { Jsoup.parse(html, baseUrl) }
+            val studio = animeData?.studio?.takeIf { it.isNotBlank() }
+                ?: animeData?.studios?.firstOrNull { it.isNotBlank() }
+                ?: animeData?.releasePreview?.studio?.takeIf { it.isNotBlank() }
+                ?: doc.selectFirst("*:matchesOwn((?i)^studio:?)")?.nextElementSibling()?.text()?.takeIf { it.isNotBlank() }
+                ?: doc.selectFirst("*:containsOwn(Studio)")?.text()?.substringAfter("Studio")?.trim(':', ' ')?.takeIf { it.isNotBlank() }
+                ?: "AnimeCube"
+
+            author = studio
+            artist = studio
             if (animeData != null) {
                 title = animeData.title ?: ""
                 description = animeData.description
@@ -137,7 +140,6 @@ class AnimeCube : AnimeHttpSource() {
                     else -> SAnime.UNKNOWN
                 }
             } else {
-                val doc = Jsoup.parse(html, baseUrl)
                 title = doc.selectFirst("h1")?.text()?.trim() ?: ""
                 description = doc.selectFirst("p")?.text()?.trim()
                 thumbnail_url = doc.selectFirst("img")?.attr("abs:src")
