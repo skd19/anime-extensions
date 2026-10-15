@@ -10,4 +10,6 @@ apply plugin: "kei.plugins.extension.legacy"
 
 dependencies {
     implementation(project(":lib:dailymotionextractor"))
+    implementation(project(":lib:rumbleextractor"))
+    implementation(project(":lib:youtubeextractor"))
 }

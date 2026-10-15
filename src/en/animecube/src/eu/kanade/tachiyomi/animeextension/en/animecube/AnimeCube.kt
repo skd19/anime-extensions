@@ -2,6 +2,8 @@ package eu.kanade.tachiyomi.animeextension.en.animecube
 
 import android.util.Base64
 import aniyomi.lib.dailymotionextractor.DailymotionExtractor
+import aniyomi.lib.rumbleextractor.RumbleExtractor
+import aniyomi.lib.youtubeextractor.YoutubeExtractor
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.Hoster
@@ -57,6 +59,8 @@ class AnimeCube : AnimeHttpSource() {
     }
 
     private val dailymotionExtractor by lazy { DailymotionExtractor(client, desktopHeaders) }
+    private val rumbleExtractor by lazy { RumbleExtractor(client, desktopHeaders) }
+    private val youtubeExtractor by lazy { YoutubeExtractor(client, desktopHeaders) }
 
     private val dateFormat by lazy {
         SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
@@ -300,27 +304,78 @@ class AnimeCube : AnimeHttpSource() {
             else -> runCatching { bodyStr.parseAs<EpisodeSourcesResponse>().sources }.getOrNull()
         } ?: return emptyList()
 
-        return rawSources.distinctBy { (it.privateId ?: it.videoId) ?: "" }.mapNotNull { source ->
+        return rawSources.mapNotNull { source ->
             val videoId = source.videoId
             val privateId = source.privateId
-            val targetId = if (!privateId.isNullOrBlank()) privateId else videoId
-            if (targetId.isNullOrBlank()) return@mapNotNull null
-
-            val platform = source.platform ?: "dailymotion"
-            if (!platform.equals("dailymotion", ignoreCase = true)) return@mapNotNull null
-
-            val dailyUrl = "https://geo.dailymotion.com/player/x1h6z6.html?video=$targetId"
             val qualitySuffix = if (!source.quality.isNullOrBlank()) " - ${source.quality}" else ""
-            Hoster(
-                hosterName = "Dailymotion$qualitySuffix",
-                hosterUrl = dailyUrl,
-            )
-        }
+            val subSuffix = if (source.goodSub == true) " (GoodSub)" else ""
+
+            when (source.platform?.lowercase()) {
+                "dailymotion", null, "" -> {
+                    val targetId = privateId.takeUnless { it.isNullOrBlank() }
+                        ?: videoId.takeUnless { it.isNullOrBlank() }
+                        ?: return@mapNotNull null
+                    val dailyUrl = "https://geo.dailymotion.com/player/x1h6z6.html?video=$targetId"
+                    Hoster(
+                        hosterName = "Dailymotion$qualitySuffix$subSuffix",
+                        hosterUrl = dailyUrl,
+                    )
+                }
+                "rumble" -> {
+                    val targetId = videoId.takeUnless { it.isNullOrBlank() } ?: return@mapNotNull null
+                    val rumbleId = if (targetId.startsWith("v", ignoreCase = true)) targetId else "v$targetId"
+                    val rumbleUrl = "https://rumble.com/embed/$rumbleId"
+                    Hoster(
+                        hosterName = "Rumble$qualitySuffix$subSuffix",
+                        hosterUrl = rumbleUrl,
+                    )
+                }
+                "youtube" -> {
+                    val targetId = videoId.takeUnless { it.isNullOrBlank() } ?: return@mapNotNull null
+                    val ytUrl = "https://www.youtube.com/watch?v=$targetId"
+                    Hoster(
+                        hosterName = "YouTube$qualitySuffix$subSuffix",
+                        hosterUrl = ytUrl,
+                    )
+                }
+                else -> {
+                    val targetId = privateId.takeUnless { it.isNullOrBlank() }
+                        ?: videoId.takeUnless { it.isNullOrBlank() }
+                        ?: return@mapNotNull null
+                    val hostName = source.platform.replaceFirstChar(Char::uppercase)
+                    if (targetId.startsWith("v", ignoreCase = true)) {
+                        Hoster(
+                            hosterName = "Rumble$qualitySuffix$subSuffix",
+                            hosterUrl = "https://rumble.com/embed/$targetId",
+                        )
+                    } else {
+                        Hoster(
+                            hosterName = "$hostName$qualitySuffix$subSuffix",
+                            hosterUrl = "https://geo.dailymotion.com/player/x1h6z6.html?video=$targetId",
+                        )
+                    }
+                }
+            }
+        }.distinctBy { it.hosterUrl }
     }
 
-    override suspend fun getVideoList(hoster: Hoster): List<Video> = withContext(Dispatchers.IO) {
-        dailymotionExtractor.videosFromUrl(hoster.hosterUrl, prefix = "${hoster.hosterName} - ")
-            .distinctBy { it.videoUrl }
+    override suspend fun getVideoList(hoster: Hoster): List<Video> {
+        val url = hoster.hosterUrl
+        return when {
+            url.contains("dailymotion.com") -> withContext(Dispatchers.IO) {
+                dailymotionExtractor.videosFromUrl(url, prefix = "${hoster.hosterName} - ")
+                    .distinctBy { it.videoUrl }
+            }
+            url.contains("rumble.com") -> withContext(Dispatchers.IO) {
+                rumbleExtractor.videosFromUrl(url, prefix = "${hoster.hosterName} - ")
+                    .distinctBy { it.videoUrl }
+            }
+            url.contains("youtube.com") || url.contains("youtu.be") -> {
+                youtubeExtractor.videosFromUrl(url, prefix = "${hoster.hosterName} - ")
+                    .distinctBy { it.videoUrl }
+            }
+            else -> emptyList()
+        }
     }
 
     // ============================== Helper Functions ===========================
