@@ -338,23 +338,7 @@ class AnimeCube : AnimeHttpSource() {
                         hosterUrl = ytUrl,
                     )
                 }
-                else -> {
-                    val targetId = privateId.takeUnless { it.isNullOrBlank() }
-                        ?: videoId.takeUnless { it.isNullOrBlank() }
-                        ?: return@mapNotNull null
-                    val hostName = source.platform.replaceFirstChar(Char::uppercase)
-                    if (targetId.startsWith("v", ignoreCase = true)) {
-                        Hoster(
-                            hosterName = "Rumble$qualitySuffix$subSuffix",
-                            hosterUrl = "https://rumble.com/embed/$targetId",
-                        )
-                    } else {
-                        Hoster(
-                            hosterName = "$hostName$qualitySuffix$subSuffix",
-                            hosterUrl = "https://geo.dailymotion.com/player/x1h6z6.html?video=$targetId",
-                        )
-                    }
-                }
+                else -> null
             }
         }.distinctBy { it.hosterUrl }
     }
