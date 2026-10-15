@@ -14,6 +14,7 @@ import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -40,7 +41,7 @@ class AnimeCube : AnimeHttpSource() {
 
     override val lang = "en"
 
-    override val supportsLatest = true
+    override val supportsLatest = false
 
     override val client: OkHttpClient = network.client.newBuilder()
         .rateLimit(permits = 3, period = 1.seconds)
@@ -71,15 +72,23 @@ class AnimeCube : AnimeHttpSource() {
     }
 
     // ============================== Latest Updates =============================
-    override fun latestUpdatesRequest(page: Int): Request = GET(baseUrl, headers)
+    override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException()
 
-    override fun latestUpdatesParse(response: Response): AnimesPage = popularAnimeParse(response)
+    override fun latestUpdatesParse(response: Response): AnimesPage = throw UnsupportedOperationException()
 
     // ============================== Search Anime ===============================
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = if (query.startsWith("http://") || query.startsWith("https://")) {
-        GET(query, headers)
-    } else {
-        GET(baseUrl, headers)
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        val trimmedQuery = query.trim()
+        val httpUrl = trimmedQuery.toHttpUrlOrNull()
+        val baseHost = baseUrl.toHttpUrl().host
+        if (httpUrl != null && httpUrl.scheme == "https" && httpUrl.host == baseHost) {
+            return GET(httpUrl, headers)
+        }
+
+        val url = "$baseUrl/".toHttpUrl().newBuilder()
+            .addQueryParameter("q", trimmedQuery)
+            .build()
+        return GET(url, headers)
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
@@ -157,14 +166,14 @@ class AnimeCube : AnimeHttpSource() {
                             url = "/anime/$animeSlug?primaryTabId=$tabId&seasonId=$seasonId&episodeId=$epId"
                             name = epTitle
                             episode_number = epNumber
-                            date_upload = dateFormat.tryParse(ep.publishedAt)
+                            date_upload = synchronized(dateFormat) { dateFormat.tryParse(ep.publishedAt) }
                         },
                     )
                 }
             }
         }
 
-        return episodes.sortedByDescending { it.episode_number }
+        return episodes.reversed()
     }
 
     // ============================== Seasons ====================================
@@ -210,9 +219,13 @@ class AnimeCube : AnimeHttpSource() {
             .add("Accept", "application/json")
             .build()
 
-        val response = runCatching {
+        val response = try {
             client.newCall(GET("$baseUrl/api/anime-sources-versions", reqHeaders)).awaitSuccess()
-        }.getOrNull() ?: return cachedVersions
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return cachedVersions
+        }
 
         val etag = response.header("X-Registry-ETag") ?: response.header("x-registry-etag")
         val bodyStr = response.body.string()
@@ -225,35 +238,19 @@ class AnimeCube : AnimeHttpSource() {
         } ?: return cachedVersions
 
         val versions = runCatching { decodedJson.parseAs<SourcesVersionsDto>() }.getOrNull()
-        if (versions != null) {
+        if (!versions?.bySeason.isNullOrEmpty()) {
             cachedVersions = versions
             versionsFetchedAt = now
         }
-        versions
+        versions ?: cachedVersions
     }
 
-    private suspend fun resolveVersionHash(slug: String, primaryTabId: String, seasonId: String): Triple<String, String, String>? {
+    private suspend fun resolveVersionHash(slug: String, primaryTabId: String, seasonId: String): String? {
         for (force in listOf(false, true)) {
             val versions = getSourcesVersions(forceRefresh = force) ?: continue
-            val slugTabs = versions.bySeason?.get(slug) ?: continue
-
-            val exactHash = slugTabs[primaryTabId]?.get(seasonId)
+            val exactHash = versions.bySeason?.get(slug)?.get(primaryTabId)?.get(seasonId)
             if (!exactHash.isNullOrBlank()) {
-                return Triple(exactHash, primaryTabId, seasonId)
-            }
-
-            // Fallback within same primary tab
-            val tabSeasons = slugTabs[primaryTabId]
-            if (!tabSeasons.isNullOrEmpty()) {
-                val firstEntry = tabSeasons.entries.first()
-                return Triple(firstEntry.value, primaryTabId, firstEntry.key)
-            }
-
-            // Fallback to first available primary tab
-            val firstTab = slugTabs.entries.firstOrNull()
-            val firstSeason = firstTab?.value?.entries?.firstOrNull()
-            if (firstTab != null && firstSeason != null) {
-                return Triple(firstSeason.value, firstTab.key, firstSeason.key)
+                return exactHash
             }
         }
         return null
@@ -266,16 +263,13 @@ class AnimeCube : AnimeHttpSource() {
         val reqSeasonId = httpUrl.queryParameter("seasonId") ?: "tab-1"
         val episodeId = httpUrl.queryParameter("episodeId") ?: ""
 
-        val resolved = resolveVersionHash(slug, reqTabId, reqSeasonId)
-        val versionV = resolved?.first ?: ""
-        val primaryTabId = resolved?.second ?: reqTabId
-        val seasonId = resolved?.third ?: reqSeasonId
+        val versionV = resolveVersionHash(slug, reqTabId, reqSeasonId) ?: return emptyList()
 
         val obf = generateObfHex()
         val apiUrl = "$baseUrl/api/anime/$slug/episode/$episodeId/sources".toHttpUrl().newBuilder()
             .addQueryParameter("v", versionV)
-            .addQueryParameter("primaryTabId", primaryTabId)
-            .addQueryParameter("seasonId", seasonId)
+            .addQueryParameter("primaryTabId", reqTabId)
+            .addQueryParameter("seasonId", reqSeasonId)
             .build()
             .toString()
 
@@ -285,9 +279,7 @@ class AnimeCube : AnimeHttpSource() {
             .add("Accept", "application/json")
             .build()
 
-        val response = runCatching {
-            client.newCall(GET(apiUrl, reqHeaders)).awaitSuccess()
-        }.getOrNull() ?: return emptyList()
+        val response = client.newCall(GET(apiUrl, reqHeaders)).awaitSuccess()
 
         val bodyStr = response.body.string()
         val encryptedDto = runCatching { bodyStr.parseAs<EncryptedPayloadDto>() }.getOrNull()
@@ -322,9 +314,8 @@ class AnimeCube : AnimeHttpSource() {
         }
     }
 
-    override suspend fun getVideoList(hoster: Hoster): List<Video> = runCatching {
-        dailymotionExtractor.videosFromUrl(hoster.hosterUrl, prefix = "${hoster.hosterName} - ")
-    }.getOrDefault(emptyList()).distinctBy { it.videoUrl }
+    override suspend fun getVideoList(hoster: Hoster): List<Video> = dailymotionExtractor.videosFromUrl(hoster.hosterUrl, prefix = "${hoster.hosterName} - ")
+        .distinctBy { it.videoUrl }
 
     // ============================== Helper Functions ===========================
     private fun parseAnimesFromHtml(html: String): List<SAnime> {
@@ -454,16 +445,32 @@ class AnimeCube : AnimeHttpSource() {
             val startIdx = idx + marker.length - 1
             var depth = 0
             var endIdx = startIdx
+            var inString = false
+            var escape = false
 
             for (i in startIdx until fullRsc.length) {
                 val c = fullRsc[i]
-                if (c == '{') {
-                    depth++
-                } else if (c == '}') {
-                    depth--
-                    if (depth == 0) {
-                        endIdx = i + 1
-                        break
+                if (escape) {
+                    escape = false
+                    continue
+                }
+                if (c == '\\') {
+                    escape = true
+                    continue
+                }
+                if (c == '"') {
+                    inString = !inString
+                    continue
+                }
+                if (!inString) {
+                    if (c == '{') {
+                        depth++
+                    } else if (c == '}') {
+                        depth--
+                        if (depth == 0) {
+                            endIdx = i + 1
+                            break
+                        }
                     }
                 }
             }
