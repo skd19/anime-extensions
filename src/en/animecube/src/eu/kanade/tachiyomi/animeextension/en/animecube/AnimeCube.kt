@@ -1,0 +1,487 @@
+package eu.kanade.tachiyomi.animeextension.en.animecube
+
+import android.util.Base64
+import aniyomi.lib.dailymotionextractor.DailymotionExtractor
+import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
+import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.Hoster
+import eu.kanade.tachiyomi.animesource.model.SAnime
+import eu.kanade.tachiyomi.animesource.model.SEpisode
+import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
+import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.awaitSuccess
+import keiyoushi.network.rateLimit
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.tryParse
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import org.jsoup.Jsoup
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import kotlin.time.Duration.Companion.seconds
+
+class AnimeCube : AnimeHttpSource() {
+
+    override val name = "AnimeCube"
+
+    override val baseUrl = "https://animecube.live"
+
+    override val lang = "en"
+
+    override val supportsLatest = true
+
+    override val client: OkHttpClient = network.client.newBuilder()
+        .rateLimit(permits = 3, period = 1.seconds)
+        .build()
+
+    override fun headersBuilder() = super.headersBuilder()
+        .set("Referer", "$baseUrl/")
+
+    private val desktopHeaders by lazy {
+        headersBuilder().build()
+    }
+
+    private val dailymotionExtractor by lazy { DailymotionExtractor(client, desktopHeaders) }
+
+    private val dateFormat by lazy {
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+    }
+
+    // ============================== Popular Anime ==============================
+    override fun popularAnimeRequest(page: Int): Request = GET(baseUrl, headers)
+
+    override fun popularAnimeParse(response: Response): AnimesPage {
+        val html = response.body.string()
+        val animes = parseAnimesFromHtml(html)
+        return AnimesPage(animes, hasNextPage = false)
+    }
+
+    // ============================== Latest Updates =============================
+    override fun latestUpdatesRequest(page: Int): Request = GET(baseUrl, headers)
+
+    override fun latestUpdatesParse(response: Response): AnimesPage = popularAnimeParse(response)
+
+    // ============================== Search Anime ===============================
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = if (query.startsWith("http://") || query.startsWith("https://")) {
+        GET(query, headers)
+    } else {
+        GET(baseUrl, headers)
+    }
+
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val requestUrl = response.request.url.toString()
+        if (requestUrl.contains("/anime/")) {
+            val doc = Jsoup.parse(response.body.string(), baseUrl)
+            val title = doc.selectFirst("h1")?.text()?.trim() ?: "Anime"
+            val anime = SAnime.create().apply {
+                this.title = title
+                url = requestUrl.substringAfter(baseUrl).substringBefore("?")
+                author = "AnimeCube"
+                artist = "AnimeCube"
+            }
+            return AnimesPage(listOf(anime), hasNextPage = false)
+        }
+
+        val html = response.body.string()
+        val allAnimes = parseAnimesFromHtml(html)
+        val query = response.request.url.queryParameter("q")?.lowercase()
+        val filtered = if (!query.isNullOrBlank()) {
+            allAnimes.filter { it.title.lowercase().contains(query) }
+        } else {
+            allAnimes
+        }
+        return AnimesPage(filtered, hasNextPage = false)
+    }
+
+    // ============================== Anime Details ==============================
+    override fun animeDetailsParse(response: Response): SAnime {
+        val html = response.body.string()
+        val animeData = extractAnimeJsonFromRsc(html)
+
+        return SAnime.create().apply {
+            author = "AnimeCube"
+            artist = "AnimeCube"
+            if (animeData != null) {
+                title = animeData.title ?: ""
+                description = animeData.description
+                thumbnail_url = animeData.coverImage
+                genre = animeData.genres?.joinToString()
+                status = when (animeData.status?.lowercase()) {
+                    "ongoing" -> SAnime.ONGOING
+                    "completed", "season-completed" -> SAnime.COMPLETED
+                    else -> SAnime.UNKNOWN
+                }
+            } else {
+                val doc = Jsoup.parse(html, baseUrl)
+                title = doc.selectFirst("h1")?.text()?.trim() ?: ""
+                description = doc.selectFirst("p")?.text()?.trim()
+                thumbnail_url = doc.selectFirst("img")?.attr("abs:src")
+            }
+            initialized = true
+        }
+    }
+
+    // ============================== Episode List ===============================
+    override fun episodeListParse(response: Response): List<SEpisode> {
+        val html = response.body.string()
+        val animeData = extractAnimeJsonFromRsc(html) ?: return emptyList()
+        val animeSlug = animeData.slug ?: response.request.url.pathSegments.lastOrNull() ?: ""
+
+        val episodes = mutableListOf<SEpisode>()
+
+        animeData.primaryTabs?.forEach { tab ->
+            val tabId = tab.id ?: "primary-1"
+            tab.seasons?.forEach { season ->
+                val seasonId = season.id ?: "tab-1"
+                season.episodes?.forEach { ep ->
+                    val epId = ep.id ?: return@forEach
+                    val epNumber = ep.number ?: 1f
+                    val epTitle = ep.title?.takeIf { it.isNotBlank() } ?: "Episode ${epNumber.toInt()}"
+
+                    episodes.add(
+                        SEpisode.create().apply {
+                            url = "/anime/$animeSlug?primaryTabId=$tabId&seasonId=$seasonId&episodeId=$epId"
+                            name = epTitle
+                            episode_number = epNumber
+                            date_upload = dateFormat.tryParse(ep.publishedAt)
+                        },
+                    )
+                }
+            }
+        }
+
+        return episodes.sortedByDescending { it.episode_number }
+    }
+
+    // ============================== Seasons ====================================
+    override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
+
+    // ============================== Hosters & Videos ===========================
+    override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
+
+    private var cachedVersions: SourcesVersionsDto? = null
+    private var versionsFetchedAt: Long = 0L
+    private val versionsMutex = Mutex()
+
+    private fun generateObfHex(): String {
+        val bytes = ByteArray(16)
+        SecureRandom().nextBytes(bytes)
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun decryptAesGcm(ciphertextB64: String, keyMaterial: String): String {
+        val keyBytes = MessageDigest.getInstance("SHA-256")
+            .digest(keyMaterial.toByteArray(Charsets.UTF_8))
+        val raw = Base64.decode(ciphertextB64, Base64.DEFAULT)
+        val iv = raw.copyOfRange(0, 12)
+        val ciphertext = raw.copyOfRange(12, raw.size)
+
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        val spec = GCMParameterSpec(128, iv)
+        val keySpec = SecretKeySpec(keyBytes, "AES")
+        cipher.init(Cipher.DECRYPT_MODE, keySpec, spec)
+        val decryptedBytes = cipher.doFinal(ciphertext)
+        return String(decryptedBytes, Charsets.UTF_8)
+    }
+
+    private suspend fun getSourcesVersions(forceRefresh: Boolean = false): SourcesVersionsDto? = versionsMutex.withLock {
+        val now = System.currentTimeMillis()
+        if (!forceRefresh && cachedVersions != null && (now - versionsFetchedAt) < 180_000L) {
+            return cachedVersions
+        }
+
+        val obf = generateObfHex()
+        val reqHeaders = headersBuilder()
+            .add("X-Obf", obf)
+            .add("Accept", "application/json")
+            .build()
+
+        val response = runCatching {
+            client.newCall(GET("$baseUrl/api/anime-sources-versions", reqHeaders)).awaitSuccess()
+        }.getOrNull() ?: return cachedVersions
+
+        val etag = response.header("X-Registry-ETag") ?: response.header("x-registry-etag")
+        val bodyStr = response.body.string()
+        val payload = runCatching { bodyStr.parseAs<EncryptedPayloadDto>() }.getOrNull()
+
+        val decodedJson = if (payload?.d != null && !etag.isNullOrBlank()) {
+            runCatching { decryptAesGcm(payload.d, "$obf|$etag") }.getOrNull()
+        } else {
+            bodyStr
+        } ?: return cachedVersions
+
+        val versions = runCatching { decodedJson.parseAs<SourcesVersionsDto>() }.getOrNull()
+        if (versions != null) {
+            cachedVersions = versions
+            versionsFetchedAt = now
+        }
+        versions
+    }
+
+    private suspend fun resolveVersionHash(slug: String, primaryTabId: String, seasonId: String): Triple<String, String, String>? {
+        for (force in listOf(false, true)) {
+            val versions = getSourcesVersions(forceRefresh = force) ?: continue
+            val slugTabs = versions.bySeason?.get(slug) ?: continue
+
+            val exactHash = slugTabs[primaryTabId]?.get(seasonId)
+            if (!exactHash.isNullOrBlank()) {
+                return Triple(exactHash, primaryTabId, seasonId)
+            }
+
+            // Fallback within same primary tab
+            val tabSeasons = slugTabs[primaryTabId]
+            if (!tabSeasons.isNullOrEmpty()) {
+                val firstEntry = tabSeasons.entries.first()
+                return Triple(firstEntry.value, primaryTabId, firstEntry.key)
+            }
+
+            // Fallback to first available primary tab
+            val firstTab = slugTabs.entries.firstOrNull()
+            val firstSeason = firstTab?.value?.entries?.firstOrNull()
+            if (firstTab != null && firstSeason != null) {
+                return Triple(firstSeason.value, firstTab.key, firstSeason.key)
+            }
+        }
+        return null
+    }
+
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
+        val httpUrl = (baseUrl + episode.url).toHttpUrl()
+        val slug = httpUrl.pathSegments.getOrNull(1) ?: ""
+        val reqTabId = httpUrl.queryParameter("primaryTabId") ?: "primary-1"
+        val reqSeasonId = httpUrl.queryParameter("seasonId") ?: "tab-1"
+        val episodeId = httpUrl.queryParameter("episodeId") ?: ""
+
+        val resolved = resolveVersionHash(slug, reqTabId, reqSeasonId)
+        val versionV = resolved?.first ?: ""
+        val primaryTabId = resolved?.second ?: reqTabId
+        val seasonId = resolved?.third ?: reqSeasonId
+
+        val obf = generateObfHex()
+        val apiUrl = "$baseUrl/api/anime/$slug/episode/$episodeId/sources".toHttpUrl().newBuilder()
+            .addQueryParameter("v", versionV)
+            .addQueryParameter("primaryTabId", primaryTabId)
+            .addQueryParameter("seasonId", seasonId)
+            .build()
+            .toString()
+
+        val reqHeaders = headersBuilder()
+            .set("Referer", "$baseUrl/anime/$slug")
+            .add("X-Obf", obf)
+            .add("Accept", "application/json")
+            .build()
+
+        val response = runCatching {
+            client.newCall(GET(apiUrl, reqHeaders)).awaitSuccess()
+        }.getOrNull() ?: return emptyList()
+
+        val bodyStr = response.body.string()
+        val encryptedDto = runCatching { bodyStr.parseAs<EncryptedPayloadDto>() }.getOrNull()
+        val rawSources = when {
+            encryptedDto != null && !encryptedDto.d.isNullOrBlank() && obf.isNotBlank() && versionV.isNotBlank() -> {
+                val decryptedJson = runCatching {
+                    decryptAesGcm(encryptedDto.d, "$obf|$versionV")
+                }.getOrNull()
+                decryptedJson?.let {
+                    runCatching { it.parseAs<EpisodeSourcesResponse>().sources }.getOrNull()
+                }
+            }
+            encryptedDto != null && !encryptedDto.sources.isNullOrEmpty() -> encryptedDto.sources
+            else -> runCatching { bodyStr.parseAs<EpisodeSourcesResponse>().sources }.getOrNull()
+        } ?: return emptyList()
+
+        return rawSources.distinctBy { (it.privateId ?: it.videoId) ?: "" }.mapNotNull { source ->
+            val videoId = source.videoId
+            val privateId = source.privateId
+            val targetId = if (!privateId.isNullOrBlank()) privateId else videoId
+            if (targetId.isNullOrBlank()) return@mapNotNull null
+
+            val platform = source.platform ?: "dailymotion"
+            if (!platform.equals("dailymotion", ignoreCase = true)) return@mapNotNull null
+
+            val dailyUrl = "https://geo.dailymotion.com/player/x1h6z6.html?video=$targetId"
+            val qualitySuffix = if (!source.quality.isNullOrBlank()) " - ${source.quality}" else ""
+            Hoster(
+                hosterName = "Dailymotion$qualitySuffix",
+                hosterUrl = dailyUrl,
+            )
+        }
+    }
+
+    override suspend fun getVideoList(hoster: Hoster): List<Video> = runCatching {
+        dailymotionExtractor.videosFromUrl(hoster.hosterUrl, prefix = "${hoster.hosterName} - ")
+    }.getOrDefault(emptyList()).distinctBy { it.videoUrl }
+
+    // ============================== Helper Functions ===========================
+    private fun parseAnimesFromHtml(html: String): List<SAnime> {
+        val animes = mutableListOf<SAnime>()
+        val doc = Jsoup.parse(html, baseUrl)
+
+        doc.select("a[href^=\"/anime/\"], a[href*=\"animecube.live/anime/\"]").forEach { element ->
+            val href = element.attr("href")
+            val cleanPath = href.toHttpUrlOrNull()?.encodedPath ?: href.substringBefore("?")
+            if (cleanPath == "/anime" || cleanPath == "/anime/") return@forEach
+
+            val altTitle = element.selectFirst("img")?.attr("alt")?.trim()
+            val ariaTitle = element.attr("aria-label").trim()
+            val title = when {
+                !altTitle.isNullOrBlank() -> altTitle
+                ariaTitle.isNotBlank() -> ariaTitle
+                else -> cleanPath.substringAfterLast("/").replace("-", " ")
+                    .split(" ").joinToString(" ") { word -> word.replaceFirstChar(Char::uppercase) }
+            }
+
+            if (title.isBlank() || animes.any { it.url == cleanPath }) return@forEach
+
+            val thumbUrl = element.selectFirst("img")?.let { img ->
+                val src = img.attr("abs:src")
+                if (src.isNotBlank()) src else img.attr("src")
+            }
+
+            animes.add(
+                SAnime.create().apply {
+                    url = cleanPath
+                    this.title = title
+                    thumbnail_url = thumbUrl
+                    author = "AnimeCube"
+                    artist = "AnimeCube"
+                },
+            )
+        }
+
+        return animes
+    }
+
+    private val rscPushRegex = Regex("""self\.__next_f\.push\(\[(\d+),\s*"((?:[^"\\]|\\.)*)"]\)""")
+
+    private fun unescapeJsString(s: String): String {
+        val sb = StringBuilder(s.length)
+        var i = 0
+        val n = s.length
+        while (i < n) {
+            val c = s[i]
+            if (c == '\\' && i + 1 < n) {
+                when (val next = s[i + 1]) {
+                    '"' -> {
+                        sb.append('"')
+                        i += 2
+                    }
+                    '\\' -> {
+                        sb.append('\\')
+                        i += 2
+                    }
+                    '/' -> {
+                        sb.append('/')
+                        i += 2
+                    }
+                    'b' -> {
+                        sb.append('\b')
+                        i += 2
+                    }
+                    'f' -> {
+                        sb.append('\u000C')
+                        i += 2
+                    }
+                    'n' -> {
+                        sb.append('\n')
+                        i += 2
+                    }
+                    'r' -> {
+                        sb.append('\r')
+                        i += 2
+                    }
+                    't' -> {
+                        sb.append('\t')
+                        i += 2
+                    }
+                    'u' -> {
+                        if (i + 5 < n) {
+                            val code = s.substring(i + 2, i + 6).toIntOrNull(16)
+                            if (code != null) {
+                                sb.append(code.toChar())
+                                i += 6
+                            } else {
+                                sb.append(c)
+                                i += 1
+                            }
+                        } else {
+                            sb.append(c)
+                            i += 1
+                        }
+                    }
+                    else -> {
+                        sb.append(next)
+                        i += 2
+                    }
+                }
+            } else {
+                sb.append(c)
+                i += 1
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun extractAnimeJsonFromRsc(html: String): AnimeDetailDto? {
+        val rscBuilder = StringBuilder()
+        rscPushRegex.findAll(html).forEach { match ->
+            val chunkRaw = match.groupValues[2]
+            rscBuilder.append(unescapeJsString(chunkRaw))
+        }
+        val fullRsc = rscBuilder.toString()
+
+        val marker = """"anime":{"""
+        var currIdx = 0
+
+        while (currIdx < fullRsc.length) {
+            val idx = fullRsc.indexOf(marker, currIdx)
+            if (idx == -1) break
+
+            val startIdx = idx + marker.length - 1
+            var depth = 0
+            var endIdx = startIdx
+
+            for (i in startIdx until fullRsc.length) {
+                val c = fullRsc[i]
+                if (c == '{') {
+                    depth++
+                } else if (c == '}') {
+                    depth--
+                    if (depth == 0) {
+                        endIdx = i + 1
+                        break
+                    }
+                }
+            }
+
+            if (depth == 0 && endIdx > startIdx) {
+                val jsonBlock = fullRsc.substring(startIdx, endIdx)
+                val dto = runCatching {
+                    jsonBlock.parseAs<AnimeDetailDto>()
+                }.getOrNull()
+
+                if (dto != null && (!dto.primaryTabs.isNullOrEmpty() || !dto.title.isNullOrBlank())) {
+                    return dto
+                }
+            }
+
+            currIdx = if (endIdx > idx) endIdx else idx + marker.length
+        }
+
+        return null
+    }
+}
