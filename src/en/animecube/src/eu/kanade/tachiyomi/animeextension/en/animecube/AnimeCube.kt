@@ -15,8 +15,10 @@ import keiyoushi.network.rateLimit
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
@@ -314,8 +316,10 @@ class AnimeCube : AnimeHttpSource() {
         }
     }
 
-    override suspend fun getVideoList(hoster: Hoster): List<Video> = dailymotionExtractor.videosFromUrl(hoster.hosterUrl, prefix = "${hoster.hosterName} - ")
-        .distinctBy { it.videoUrl }
+    override suspend fun getVideoList(hoster: Hoster): List<Video> = withContext(Dispatchers.IO) {
+        dailymotionExtractor.videosFromUrl(hoster.hosterUrl, prefix = "${hoster.hosterName} - ")
+            .distinctBy { it.videoUrl }
+    }
 
     // ============================== Helper Functions ===========================
     private fun parseAnimesFromHtml(html: String): List<SAnime> {
