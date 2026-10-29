@@ -81,14 +81,79 @@ abstract class Dongsub :
 
     // ============================== Search Anime ==============================
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val startIndex = ((page - 1) * PAGE_SIZE) + 1
-        val encodedQuery = URLEncoder.encode(query.trim(), "UTF-8")
-        val url = "$baseUrl/feeds/posts/default?q=$encodedQuery&alt=json&start-index=$startIndex&max-results=$PAGE_SIZE"
-        return GET(url, headers)
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = throw UnsupportedOperationException()
+
+    override fun searchAnimeParse(response: Response): AnimesPage = throw UnsupportedOperationException()
+
+    private var allSeriesCache: List<Pair<SAnime, SeriesSearchMeta>>? = null
+    private var cacheTime: Long = 0L
+
+    private suspend fun getAllSeries(): List<Pair<SAnime, SeriesSearchMeta>> {
+        val now = System.currentTimeMillis()
+        if (allSeriesCache != null && (now - cacheTime) < CACHE_TIMEOUT) {
+            return allSeriesCache!!
+        }
+        val url = "$baseUrl/feeds/posts/default/-/Series?alt=json&max-results=500"
+        val response = client.get(url, headers)
+        val json = response.bodyString()
+        val root = JSONObject(json)
+        val feed = root.optJSONObject("feed") ?: return emptyList()
+        val entries = feed.optJSONArray("entry") ?: JSONArray()
+        val series = buildList(entries.length()) {
+            for (i in 0 until entries.length()) {
+                val entry = entries.getJSONObject(i)
+                val anime = parseEntryToAnime(entry) ?: continue
+                val rawTitle = entry.optJSONObject("title")?.optString("$" + "t").orEmpty()
+                val content = entry.optJSONObject("content")?.optString("$" + "t").orEmpty()
+                val categories = buildList {
+                    val catArray = entry.optJSONArray("category")
+                    if (catArray != null) {
+                        for (j in 0 until catArray.length()) {
+                            val term = catArray.getJSONObject(j).optString("term")
+                            if (term.isNotBlank()) add(term.lowercase())
+                        }
+                    }
+                }
+                val meta = SeriesSearchMeta(
+                    titleLower = rawTitle.lowercase(),
+                    contentLower = content.lowercase(),
+                    categoriesLower = categories,
+                )
+                add(anime to meta)
+            }
+        }
+        allSeriesCache = series
+        cacheTime = now
+        return series
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage = parseFeed(response)
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        val seriesList = getAllSeries()
+        val cleanQuery = query.trim().lowercase()
+
+        val filtered = if (cleanQuery.isBlank()) {
+            seriesList.map { it.first }
+        } else {
+            val terms = cleanQuery.split(Regex("""\s+""")).filter { it.isNotBlank() }
+            seriesList.filter { (_, meta) ->
+                terms.all { term ->
+                    meta.titleLower.contains(term) ||
+                        meta.contentLower.contains(term) ||
+                        meta.categoriesLower.any { it.contains(term) }
+                }
+            }.map { it.first }
+        }
+
+        val startIndex = (page - 1) * PAGE_SIZE
+        if (startIndex >= filtered.size) {
+            return AnimesPage(emptyList(), false)
+        }
+        val endIndex = (startIndex + PAGE_SIZE).coerceAtMost(filtered.size)
+        val pageItems = filtered.subList(startIndex, endIndex)
+        val hasNextPage = endIndex < filtered.size
+
+        return AnimesPage(pageItems, hasNextPage)
+    }
 
     // ============================== Feed Parser ==============================
 
@@ -114,12 +179,13 @@ abstract class Dongsub :
 
     private fun parseEntryToAnime(entry: JSONObject): SAnime? {
         val alternateLink = extractAlternateLink(entry) ?: return null
-        val title = entry.optJSONObject("title")?.optString("\$t")?.trim().orEmpty()
+        val rawTitle = entry.optJSONObject("title")?.optString("$" + "t")?.trim().orEmpty()
+        val cleanTitle = CLEAN_TITLE_REGEX.replace(rawTitle, "").trim().ifEmpty { rawTitle }
         val thumbnail = extractThumbnail(entry)
 
         return SAnime.create().apply {
             setUrlWithoutDomain(alternateLink)
-            this.title = title
+            title = cleanTitle
             thumbnail_url = thumbnail
         }
     }
@@ -156,7 +222,8 @@ abstract class Dongsub :
     override fun animeDetailsParse(response: Response): SAnime {
         val document = response.asJsoup()
         return SAnime.create().apply {
-            title = document.selectFirst("h1.entry-judul, h1.post-title, h1.title-stream, h1")?.text()?.trim().orEmpty()
+            val rawTitle = document.selectFirst("h1.entry-judul, h1.post-title, h1.title-stream, h1")?.text()?.trim().orEmpty()
+            title = CLEAN_TITLE_REGEX.replace(rawTitle, "").trim().ifEmpty { rawTitle }
             thumbnail_url = document.selectFirst("img.post-thumbnail, div.thumbox img, div.thumbnail img, meta[property=og:image]")?.let {
                 it.attr("data-src").ifEmpty { it.attr("src") }.ifEmpty { it.attr("content") }
             }?.let(::upgradeImageUrl)
@@ -341,11 +408,13 @@ abstract class Dongsub :
         private val PREF_QUALITY_VALUES = PREF_QUALITY_ENTRIES
 
         private const val PAGE_SIZE = 20
+        private const val CACHE_TIMEOUT = 10 * 60 * 1000L
 
         private val RESIZE_REGEX = Regex("""/(?:s\d+(-c)?|w\d+-h\d+(-c)?)/""")
         private val IMG_REGEX = Regex("""<img[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
         private val LABEL_EPISODE_REGEX = Regex("""var\s+label_episode\s*=\s*["']([^"']+)["']""")
         private val EPISODE_NUMBER_REGEX = Regex("""Episode\s+(\d+(?:\.\d+)?)""", RegexOption.IGNORE_CASE)
+        private val CLEAN_TITLE_REGEX = Regex("""\s+(?:Episode|Eps\.?)\s+.*""", RegexOption.IGNORE_CASE)
 
         private val SYSTEM_TAGS = setOf(
             "episode",
@@ -379,3 +448,9 @@ abstract class Dongsub :
         )
     }
 }
+
+private data class SeriesSearchMeta(
+    val titleLower: String,
+    val contentLower: String,
+    val categoriesLower: List<String>,
+)
