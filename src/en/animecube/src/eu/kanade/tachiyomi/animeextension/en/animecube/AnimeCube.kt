@@ -1,9 +1,11 @@
 package eu.kanade.tachiyomi.animeextension.en.animecube
 
 import android.util.Base64
+import androidx.preference.PreferenceScreen
 import aniyomi.lib.dailymotionextractor.DailymotionExtractor
 import aniyomi.lib.rumbleextractor.RumbleExtractor
 import aniyomi.lib.youtubeextractor.YoutubeExtractor
+import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.Hoster
@@ -13,7 +15,10 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.awaitSuccess
+import keiyoushi.annotation.Source
 import keiyoushi.network.rateLimit
+import keiyoushi.utils.addListPreference
+import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
 import kotlinx.coroutines.CancellationException
@@ -37,15 +42,14 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.time.Duration.Companion.seconds
 
-class AnimeCube : AnimeHttpSource() {
-
-    override val name = "AnimeCube"
-
-    override val baseUrl = "https://animecube.live"
-
-    override val lang = "en"
+@Source
+abstract class AnimeCube :
+    AnimeHttpSource(),
+    ConfigurableAnimeSource {
 
     override val supportsLatest = false
+
+    private val preferences by getPreferencesLazy()
 
     override val client: OkHttpClient = network.client.newBuilder()
         .rateLimit(permits = 3, period = 1.seconds)
@@ -375,7 +379,7 @@ class AnimeCube : AnimeHttpSource() {
                     .distinctBy { it.videoUrl }
             }
             else -> emptyList()
-        }
+        }.sortVideos()
     }
 
     // ============================== Helper Functions ===========================
@@ -551,5 +555,66 @@ class AnimeCube : AnimeHttpSource() {
         }
 
         return null
+    }
+
+    // ============================== Preferences ==============================
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        screen.addListPreference(
+            key = PREF_QUALITY_KEY,
+            title = "Preferred quality",
+            default = PREF_QUALITY_DEFAULT,
+            summary = "%s",
+            entries = PREF_QUALITY_ENTRIES,
+            entryValues = PREF_QUALITY_VALUES,
+        )
+    }
+
+    // ============================== Sorting & Helpers ==============================
+
+    override fun List<Video>.sortVideos(): List<Video> {
+        val quality = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT) ?: PREF_QUALITY_DEFAULT
+        return sortedWith(
+            compareByDescending<Video> { matchesQuality(it.videoTitle, quality) }
+                .thenByDescending { extractResolution(it.videoTitle) },
+        )
+    }
+
+    private fun matchesQuality(title: String, quality: String): Boolean = when (quality.lowercase()) {
+        "4k", "2160", "2160p" -> {
+            title.contains("4k", ignoreCase = true) || title.contains("2160")
+        }
+        else -> {
+            val num = quality.filter { it.isDigit() }
+            if (num.isNotEmpty()) {
+                title.contains("${num}p", ignoreCase = true) || title.contains(num)
+            } else {
+                title.contains(quality, ignoreCase = true)
+            }
+        }
+    }
+
+    private fun extractResolution(title: String): Int {
+        if (title.contains("4k", ignoreCase = true) || title.contains("2160")) return 2160
+        return Regex("""(\d+)p""", RegexOption.IGNORE_CASE).find(title)?.groupValues?.get(1)?.toIntOrNull()
+            ?: Regex("""[xX](\d+)""").find(title)?.groupValues?.get(1)?.toIntOrNull()
+            ?: Regex("""\b(\d{3,4})\b""").find(title)?.groupValues?.get(1)?.toIntOrNull()
+            ?: 0
+    }
+
+    companion object {
+        private const val PREF_QUALITY_KEY = "preferred_quality"
+        private const val PREF_QUALITY_DEFAULT = "1080p"
+        private val PREF_QUALITY_ENTRIES = listOf(
+            "4K",
+            "1440p",
+            "1080p",
+            "720p",
+            "480p",
+            "360p",
+            "240p",
+            "144p",
+        )
+        private val PREF_QUALITY_VALUES = PREF_QUALITY_ENTRIES
     }
 }
